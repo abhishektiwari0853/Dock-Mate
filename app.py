@@ -1,51 +1,122 @@
-# 1. Import libraries
 import streamlit as st
 import pandas as pd
-import numpy as np
 import math
-import vendors as vd  # our vendor module
+import json
+import threading
+import websocket
+import vendors as vd
 
-# 2. Page config
-st.set_page_config(page_title="DockMate", layout="wide")
-st.title("🚢 DockMate - Ship Breakdown Assistance")
+# -------------------- AISstream API Key --------------------
+API_KEY = "57d10e3b695f0f80099caced993ff7ed068e7f5f"  # Store carefully
 
-# 3. Load ports data (cached so baar-baar read na ho)
+# -------------------- Global Ship Location (Thread Safe) --------------------
+if 'ship_location' not in st.session_state:
+    st.session_state.ship_location = {"lat": 18.9, "lon": 72.5}  # Default Mumbai
+if 'ws_running' not in st.session_state:
+    st.session_state.ws_running = False
+if 'current_mmsi' not in st.session_state:
+    st.session_state.current_mmsi = None
+
+# -------------------- WebSocket Callbacks --------------------
+def on_message(ws, message):
+    msg = json.loads(message)
+    if msg.get("MessageType") == "PositionReport":
+        pos = msg["Message"]["PositionReport"]
+        lat = pos["Latitude"]
+        lon = pos["Longitude"]
+        # Update location in session state (accessible from Streamlit main thread)
+        st.session_state.ship_location = {"lat": lat, "lon": lon}
+
+def on_error(ws, error):
+    pass  # handle silently for now
+
+def on_close(ws, close_code, close_msg):
+    st.session_state.ws_running = False
+
+def on_open(ws, mmsi):
+    """Subscribe to PositionReports for a specific MMSI."""
+    sub_msg = {
+        "Apikey": API_KEY,
+        "BoundingBoxes": [[-90, -180], [90, 180]],  # whole world
+        "FiltersShipMMSI": [mmsi],                  # only this ship
+        "FilterMessageTypes": ["PositionReport"]
+    }
+    ws.send(json.dumps(sub_msg))
+    st.session_state.ws_running = True
+
+# -------------------- Start WebSocket Thread --------------------
+def start_ws(mmsi):
+    ws = websocket.WebSocketApp(
+        "wss://stream.aisstream.io/v0/stream",
+        on_open=lambda ws: on_open(ws, mmsi),
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
+
+# -------------------- Load ports (cached) --------------------
 @st.cache_data
 def load_ports():
-    df = pd.read_csv('ports.csv')  # simple CSV file
+    df = pd.read_csv('ports.csv')
     df.columns = ['port_name', 'lat', 'lon', 'country']
     return df
 
 ports = load_ports()
 
-# 4. Haversine distance function (geopy hatane ke liye)
+# -------------------- Helper Functions --------------------
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius in km
+    R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
-# 5. Constants
-PER_KM_COST = 50  # delivery cost per km
+PER_KM_COST = 50
 
 def calculate_total_cost(price, dist):
     return price + (dist * PER_KM_COST)
 
-# 6. Sidebar for inputs
-st.sidebar.header("Ship Breakdown Alert")
-ship_lat = st.sidebar.number_input("Ship Latitude", value=18.9, format="%.4f")
-ship_lon = st.sidebar.number_input("Ship Longitude", value=72.5, format="%.4f")
-part_needed = st.sidebar.selectbox("Required Part", 
-                                  ["Engine Gasket", "Fuel Pump", "Navigation Light"])
+# -------------------- Streamlit UI --------------------
+st.set_page_config(page_title="DockMate", layout="wide")
+st.title("🚢 DockMate - Ship Breakdown Assistance (Live Satellite AIS)")
 
-# 7. Alert button action
+# ---- Sidebar: AIS Tracking ----
+st.sidebar.header("🛰 AIS Tracking Setup")
+mmsi_input = st.sidebar.text_input("Ship MMSI (9 digits)", value="", max_chars=9)
+if st.sidebar.button("Connect AIS"):
+    if mmsi_input:
+        # Restart WebSocket if MMSI changed or not running
+        if st.session_state.current_mmsi != mmsi_input or not st.session_state.ws_running:
+            st.session_state.current_mmsi = mmsi_input
+            t = threading.Thread(target=start_ws, args=(mmsi_input,), daemon=True)
+            t.start()
+            st.sidebar.success(f"Tracking MMSI {mmsi_input}...")
+    else:
+        st.sidebar.error("Enter a valid 9-digit MMSI")
+
+st.sidebar.markdown("---")
+st.sidebar.header("📍 Current Ship Location")
+ship_lat = st.session_state.ship_location["lat"]
+ship_lon = st.session_state.ship_location["lon"]
+st.sidebar.write(f"Lat: {ship_lat:.4f}, Lon: {ship_lon:.4f}")
+
+# Manual override
+override_lat = st.sidebar.number_input("Override Latitude", value=ship_lat, format="%.4f")
+override_lon = st.sidebar.number_input("Override Longitude", value=ship_lon, format="%.4f")
+ship_lat = override_lat
+ship_lon = override_lon
+
+st.sidebar.markdown("---")
+part_needed = st.sidebar.selectbox("Required Part",
+                                    ["Engine Gasket", "Fuel Pump", "Navigation Light"])
+
+# ---- Main Action ----
 if st.sidebar.button("🚨 Send Breakdown Alert"):
-    # Compute distance to all ports
+    # Calculate distances and vendors
     ports['distance_km'] = ports.apply(
         lambda row: haversine(ship_lat, ship_lon, row['lat'], row['lon']), axis=1)
-    # Nearest 5 ports
     nearest_ports = ports.nsmallest(5, 'distance_km')
 
     results = []
@@ -69,30 +140,28 @@ if st.sidebar.button("🚨 Send Breakdown Alert"):
             })
 
     if results:
-        # Cheapest first
         results.sort(key=lambda x: x['Total Cost (₹)'])
         st.success(f"Found {len(results)} vendor options for {part_needed}.")
 
-        # Show map with ship and ports
+        # Map: ship + ports
         map_data = pd.DataFrame({
             'lat': [ship_lat] + [r['Port Lat'] for r in results],
             'lon': [ship_lon] + [r['Port Lon'] for r in results]
         })
         st.map(map_data)
 
-        # Display table
+        # Table
         display_df = pd.DataFrame(results).drop(columns=['Port Lat', 'Port Lon'])
         st.dataframe(display_df, use_container_width=True)
 
-        # Highlight best option
+        # Best option
         best = results[0]
-        st.metric("🏆 Best Option", 
-                  f"{best['Vendor']} at {best['Port']}", 
+        st.metric("🏆 Best Option",
+                  f"{best['Vendor']} at {best['Port']}",
                   f"₹{best['Total Cost (₹)']}")
     else:
         st.error("No vendor found for this part in nearby ports. Try different part/location.")
-
 else:
-    # Default map showing only ship location
+    # Default map: show only ship
     st.map(pd.DataFrame({'lat': [ship_lat], 'lon': [ship_lon]}))
-    st.info("Enter ship coordinates and required part, then click 'Send Alert'.")
+    st.info("Enter ship MMSI and click 'Connect AIS' to track live location, or manually set coordinates. Then click 'Send Alert'.")
